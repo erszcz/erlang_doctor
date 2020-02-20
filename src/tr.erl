@@ -40,6 +40,9 @@
          terminate/2,
          code_change/3]).
 
+%% Use tr as a dbg trace handler
+-export([handle_trace/2]).
+
 %% copied, not included from tr.hrl to make it self-contained
 -record(tr, {index :: pos_integer(),
              pid :: pid(),
