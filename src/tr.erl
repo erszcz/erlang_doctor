@@ -40,7 +40,8 @@
          app_modules/1,
          mfarity/1,
          mfargs/2,
-         ts/1]).
+         ts/1,
+         to_map/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -695,6 +696,12 @@ mfargs({M, F, Arity}, Args) when length(Args) =:= Arity -> {M, F, Args}.
 %% @doc Returns human-readable timestamp according to RFC 3339.
 -spec ts(tr()) -> string().
 ts(#tr{ts = TS}) -> calendar:system_time_to_rfc3339(TS, [{unit, microsecond}]).
+
+%% @doc Convert trace records to maps.
+-spec to_map(tr()) -> map().
+to_map(#tr{} = Tr) ->
+    IndexedFields = lists:enumerate([record | record_info(fields, tr)]),
+    maps:from_list(lists:map(fun ({Index, Field}) -> {Field, element(Index, Tr)} end, IndexedFields)).
 
 %% gen_server callbacks
 
