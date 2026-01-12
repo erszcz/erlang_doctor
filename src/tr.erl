@@ -122,7 +122,7 @@
                         msg_trigger := msg_trigger()}.
 -type trace_options() :: #{modules => module_spec(),
                            pids => pids(),
-                           children := children_spec(),
+                           children => children_spec(),
                            msg => message_event_types(),
                            msg_trigger => msg_trigger()}.
 %% Options for tracing.
