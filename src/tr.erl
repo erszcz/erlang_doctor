@@ -110,19 +110,19 @@
                    trace := none | trace_spec(),
                    tracer_pid := none | pid()}.
 
--type children_spec() :: all | first | none.
+-type new_children_flags() :: all | first | none.
 %% Describes which newly spawned children of specified processes to trace - none by default.
 %% Handy for tracing a subtree of a process hierarchy, e.g. by tracing a supervisor,
 %% its children, and newly started children.
 
 -type trace_spec() :: #{modules := module_spec(),
                         pids := pids(),
-                        children := children_spec(),
+                        new_children := new_children_flags(),
                         msg := message_event_types(),
                         msg_trigger := msg_trigger()}.
 -type trace_options() :: #{modules => module_spec(),
                            pids => pids(),
-                           children => children_spec(),
+                           new_children => new_children_flags(),
                            msg => message_event_types(),
                            msg_trigger => msg_trigger()}.
 %% Options for tracing.
@@ -300,7 +300,7 @@ trace_apps(Apps) ->
 trace(Modules) when is_list(Modules) ->
     trace(#{modules => Modules});
 trace(Opts) ->
-    DefaultOpts = #{modules => [], pids => all, children => none,
+    DefaultOpts = #{modules => [], pids => all, new_children => none,
                     msg => none, msg_trigger => after_traced_call},
     Timeout = timer:minutes(1),
     gen_server:call(?MODULE, {start_trace, call, maps:merge(DefaultOpts, Opts)}, Timeout).
@@ -858,9 +858,9 @@ msg_trace_flags(#{msg := none}) -> [].
 
 basic_trace_flags() -> [call, timestamp].
 
-process_trace_flags(#{children := all}) -> [set_on_spawn];
-process_trace_flags(#{children := first}) -> [set_on_first_spawn];
-process_trace_flags(#{children := none}) -> [].
+process_trace_flags(#{new_children := all}) -> [set_on_spawn];
+process_trace_flags(#{new_children := first}) -> [set_on_first_spawn];
+process_trace_flags(#{new_children := none}) -> [].
 
 -spec set_tracing(pids(), boolean(), erlang_trace_flags()) -> ok.
 set_tracing(all, How, FlagList) ->
