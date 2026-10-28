@@ -95,17 +95,28 @@
 -type pids() :: [pid()] | all. % A list of processes to trace. Default: `all'.
 -type limit() :: pos_integer() | infinity. % Maximum number of items.
 -type index() :: pos_integer(). % Unique, auto-incremented identifier of a {@link tr()} record.
--type table() :: atom(). % ETS table name.
+-type table() :: trdb:table(). % Table name, or a backend handle.
 -type mfargs() :: {module(), atom(), list()}. % Module, function and arguments.
 
--type init_options() :: #{tab => table(), index => index(), limit => limit()}.
+-type backend() :: ets | module() | {module(), [term()]}.
+%% Store behind {@link trdb} used for the trace table.
+%%
+%% `ets' (default) keeps traces in a plain ETS table. A module name selects
+%% that {@link trdb} backend; `{Module, Options}' also passes options to it,
+%% e.g. `{trdb_sqlite, [{file, "traces.db"}]}'. Options are appended to the
+%% table options, so `{backend, Module}' is added for you.
+
+-type init_options() :: #{tab => table(), backend => backend(),
+                          index => index(), limit => limit()}.
 %% Initialization options.
 %%
-%% `tab' is the ETS table used for storing traces (default: `trace').
+%% `tab' is the table used for storing traces (default: `trace').
+%% `backend' is the store behind it (default: `ets').
 %% `index' is the index value of the first inserted trace (default: 1).
 %% When size of `tab' reaches the optional `limit', tracing is stopped.
 
 -type state() :: #{tab := table(),
+                   backend := backend(),
                    index := index(),
                    limit := limit(),
                    trace := none | trace_spec(),
@@ -324,19 +335,25 @@ stop_tracing() ->
 stop() ->
     gen_server:stop(?MODULE).
 
-%% @doc Returns the name of the current ETS trace table in use.
+%% @doc Returns the handle of the current trace table.
+%%
+%% An ETS table is returned as its name; a backend table as its opaque handle.
 -spec tab() -> table().
 tab() ->
     gen_server:call(?MODULE, get_tab).
 
-%% @doc Sets a new ETS table for collecting traces, creating it if it doesn't exist.
+%% @doc Sets a new table for collecting traces, creating it if it doesn't exist.
+%%
+%% With a non-`ets' backend the table is created on that backend.
 -spec set_tab(table()) -> ok.
-set_tab(Tab) when is_atom(Tab) ->
+set_tab(Tab) ->
     gen_server:call(?MODULE, {set_tab, Tab}).
 
 %% @doc Loads an ETS trace table from a file, and makes it the current table.
 %%
-%% Overwrites the current table if it is empty.
+%% Overwrites the current table if it is empty. Only the `ets' backend can do
+%% this: the file is an ETS table file, and other backends return
+%% `{error, {unsupported_backend, Module}}'.
 -spec load(file:name_all()) -> {ok, table()} | {error, any()}.
 load(File) when is_binary(File) ->
     load(binary_to_list(File));
@@ -344,6 +361,9 @@ load(File) when is_list(File) ->
     gen_server:call(?MODULE, {load, File}, timer:minutes(2)).
 
 %% @doc Dumps the `tab()' table to a file.
+%%
+%% The file format is the backend's: an ETS table file for `ets', a SQLite
+%% database snapshot for `trdb_sqlite'.
 -spec dump(file:name_all()) -> ok | {error, any()}.
 dump(File) when is_binary(File) ->
     dump(binary_to_list(File));
@@ -713,12 +733,15 @@ enumerate(List) ->
 init(Opts) ->
     process_flag(trap_exit, true),
     Defaults = #{tab => default_tab(),
+                 backend => ets,
                  index => initial_index(),
                  limit => application:get_env(erlang_doctor, limit, infinity)},
-    FinalOpts = #{tab := Tab} = maps:merge(Defaults, Opts),
-    State = maps:merge(FinalOpts, #{trace => none, tracer_pid => none}),
-    create_tab(Tab),
-    {ok, State}.
+    FinalOpts = #{tab := TabName, backend := Backend} = maps:merge(Defaults, Opts),
+    %% trdb:new/2 may return a handle rather than the name (a backend table),
+    %% so the handle is what gets stored.
+    Tab = create_tab(TabName, Backend),
+    State0 = maps:merge(FinalOpts, #{trace => none, tracer_pid => none}),
+    {ok, State0#{tab := Tab}}.
 
 %% @private
 -spec handle_call(any(), {pid(), any()}, state()) -> {reply, ok | {error, atom()}, state()}.
@@ -738,6 +761,9 @@ handle_call(clean, _From, State = #{tab := Tab}) ->
 handle_call({dump, File}, _From, State = #{tab := Tab}) ->
     Reply = trdb:tab2file(Tab, File),
     {reply, Reply, State};
+handle_call({load, _File}, _From, State = #{backend := Backend}) when Backend =/= ets ->
+    %% `trdb:file2tab/1' reads ETS table files; a backend keeps its own store.
+    {reply, {error, {unsupported_backend, backend_module(Backend)}}, State};
 handle_call({load, File}, _From, State) ->
     Tab = maps:get(tab, State),
     Reply = case {trdb:info(Tab, id), trdb:info(Tab, size)} of
@@ -756,12 +782,12 @@ handle_call({load, File}, _From, State) ->
     {reply, Reply, NewState};
 handle_call(get_tab, _From, State = #{tab := Tab}) ->
     {reply, Tab, State};
-handle_call({set_tab, NewTab}, _From, State) ->
-    case trdb:info(NewTab) of
-        undefined -> create_tab(NewTab);
-        [_|_] -> ok
-    end,
-    {reply, ok, State#{tab := NewTab, index := index(NewTab)}};
+handle_call({set_tab, NewTab}, _From, State = #{backend := Backend}) ->
+    Handle = case trdb:info(NewTab) of
+                 undefined -> create_tab(NewTab, Backend);
+                 [_|_] -> NewTab
+             end,
+    {reply, ok, State#{tab := Handle, index := index(Handle)}};
 handle_call(Req, From, State) ->
     logger:error("Unexpected call ~p from ~p.", [Req, From]),
     {reply, ok, State}.
@@ -797,8 +823,16 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %%-------------------
 
-create_tab(Tab) ->
-    trdb:new(Tab, [named_table, public, ordered_set, {keypos, 2}]).
+create_tab(Tab, Backend) ->
+    trdb:new(Tab, [named_table, public, ordered_set, {keypos, 2} | backend_opts(Backend)]).
+
+%% `ets' adds nothing, so the default path is byte-for-byte what it was.
+backend_opts(ets) ->
+    [];
+backend_opts(Module) when is_atom(Module) ->
+    [{backend, Module}];
+backend_opts({Module, Options}) when is_atom(Module), is_list(Options) ->
+    Options ++ [{backend, Module}].
 
 select(_MS, _DataVal, DataAcc, '$end_of_table') ->
     lists:append(lists:reverse(DataAcc));
@@ -1319,6 +1353,10 @@ initial_index() ->
 
 default_tab() ->
     trace.
+
+backend_module(ets) -> ets;
+backend_module(Module) when is_atom(Module) -> Module;
+backend_module({Module, _Options}) -> Module.
 
 foldl(F, InitialState, List) when is_list(List) -> lists:foldl(F, InitialState, List);
 foldl(F, InitialState, Tab) -> trdb:foldl(F, InitialState, Tab).

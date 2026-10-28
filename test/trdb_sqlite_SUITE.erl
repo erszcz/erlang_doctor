@@ -18,7 +18,10 @@ all() ->
      file_persistence,
      tab2file_snapshot,
      via_trdb,
-     rejects_non_trace_objects].
+     rejects_non_trace_objects,
+     tr_backend,
+     tr_backend_file,
+     reserved_table_name].
 
 row(I) ->
     #tr{index = I, pid = self(), event = call, mfa = {m, f, 1}, data = [I],
@@ -149,6 +152,66 @@ via_trdb(_Config) ->
     '$end_of_table' = End,
     true = trdb:delete(H),
     undefined = trdb:info(H).
+
+%% tr itself can run on the SQLite backend.
+tr_backend(Config) ->
+    catch tr:stop(),
+    {ok, _} = tr:start(#{tab => tr_traces, backend => trdb_sqlite}),
+    try
+        {trdb, trdb_sqlite, _} = tr:tab(),
+        ok = tr:trace([?MODULE]),
+        _ = row(1),
+        wait_for_traces(1, 200),
+        ok = tr:stop_tracing(),
+        Traces = tr:select(),
+        true = length(Traces) >= 2,
+        #tr{index = 1} = tr:lookup(1),
+        _ = tr:next(1),
+        Stats = tr:call_stat(fun(#tr{mfa = MFA}) -> MFA end),
+        true = map_size(Stats) > 0,
+        ok = tr:clean(),
+        [] = tr:select(),
+        ok = tr:dump(filename:join(?config(priv_dir, Config), "tr_snapshot.db")),
+        {error, {unsupported_backend, trdb_sqlite}} =
+            tr:load(filename:join(?config(priv_dir, Config), "ignored.ets"))
+    after
+        catch tr:stop()
+    end.
+
+%% Backend options reach the store: a file-backed trace table.
+tr_backend_file(Config) ->
+    catch tr:stop(),
+    File = filename:join(?config(priv_dir, Config), "tr_traces.db"),
+    {ok, _} = tr:start(#{tab => tr_file_traces,
+                         backend => {trdb_sqlite, [{file, File}]}}),
+    try
+        {trdb, trdb_sqlite, _} = tr:tab(),
+        ok = tr:trace([?MODULE]),
+        _ = row(2),
+        wait_for_traces(1, 200),
+        ok = tr:stop_tracing(),
+        true = length(tr:select()) > 0,
+        ok = tr:clean()
+    after
+        catch tr:stop()
+    end,
+    true = filelib:is_regular(File).
+
+%% SQLite reserves the sqlite_ prefix; say so instead of surfacing {error, 1}.
+reserved_table_name(_Config) ->
+    try
+        trdb_sqlite:new(sqlite_traces, [ordered_set, {keypos, 2}]),
+        ct:fail(expected_error)
+    catch
+        error:{reserved_table_name, sqlite_traces} -> ok
+    end.
+
+wait_for_traces(Min, Tries) ->
+    case length(tr:select()) >= Min of
+        true -> ok;
+        false when Tries > 0 -> timer:sleep(10), wait_for_traces(Min, Tries - 1);
+        false -> ct:fail(no_traces)
+    end.
 
 %% Objects that are not trace records are rejected without killing the table.
 rejects_non_trace_objects(_Config) ->

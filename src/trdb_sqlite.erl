@@ -97,10 +97,26 @@
 %% `private', `set' | `ordered_set', `{keypos, Pos}' and `{file, Path}'.
 -spec new(atom(), [term()]) -> pid().
 new(Name, Options) when is_atom(Name), is_list(Options) ->
-    case gen_server:start_link(?MODULE, {Name, Options}, []) of
+    %% The server is linked (a table should die with its owner, as an ETS table
+    %% does), so a failing init would kill the caller with an exit signal
+    %% before start_link could return {error, Reason}. Trap exits across the
+    %% call, drop the matching signal, and raise the error here instead.
+    Trapping = process_flag(trap_exit, true),
+    Result = gen_server:start_link(?MODULE, {Name, Options}, []),
+    process_flag(trap_exit, Trapping),
+    case Result of
         {ok, Pid} -> Pid;
-        {error, Reason} -> error(Reason)
+        {error, Reason} -> flush_exit(Reason), error(unwrap_crash(Reason))
     end.
+
+flush_exit(Reason) ->
+    receive {'EXIT', _Pid, Reason} -> ok after 0 -> ok end.
+
+%% A crash in init/1 comes back as {Reason, Stacktrace}; raise the reason.
+unwrap_crash({Reason, [{M, F, A, _} | _]}) when is_atom(M), is_atom(F), is_integer(A) ->
+    Reason;
+unwrap_crash(Reason) ->
+    Reason.
 
 %% @doc Closes the table and drops its rows.
 -spec delete(pid()) -> true.
@@ -231,7 +247,7 @@ init({Name, Options}) ->
     {ok, Db} = esqlite3:open(File),
     ok = esqlite3:exec(Db, "PRAGMA journal_mode=WAL"),
     ok = esqlite3:exec(Db, "PRAGMA synchronous=NORMAL"),
-    Table = quote(Name),
+    Table = quote_string(table_name(Name)),
     ok = esqlite3:exec(Db, "CREATE TABLE IF NOT EXISTS " ++ Table ++ " ("
                        "idx INTEGER PRIMARY KEY,"
                        " pid TEXT,"
@@ -496,8 +512,14 @@ stop(Ref) ->
     catch exit:_ -> ok
     end.
 
-quote(Name) ->
-    quote_string(atom_to_list(Name)).
+%% SQLite reserves names starting with `sqlite_' for its own tables and fails
+%% with a bare {error, 1}, so reject them here with something readable.
+table_name(Name) ->
+    String = atom_to_list(Name),
+    case string:lowercase(String) of
+        "sqlite_" ++ _ -> error({reserved_table_name, Name});
+        _ -> String
+    end.
 
 quote_string(String) ->
     [$" | [escape(C) || C <- String] ++ [$"]].
