@@ -43,6 +43,18 @@
 %% A file-backed table keeps its rows across restarts; {@link delete/1} drops
 %% them, {@link delete_all_objects/1} does not.
 %%
+%% == Writes ==
+%%
+%% Writes are asynchronous and buffered. {@link insert/2} validates the object
+%% and casts it to the server, which accumulates rows and commits them in one
+%% transaction every 200 ms or 5000 rows, whichever comes first. Every read
+%% flushes the buffer first, so a `lookup' after an `insert' sees the row; a
+%% clean stop flushes in `terminate/2'. A VM crash therefore loses at most one
+%% buffered batch rather than the whole table.
+%%
+%% The server warns on standard error as the trace database grows: every 100k
+%% flushed rows, and when the database file passes 100 MB, 500 MB and 1 GB.
+%%
 %% == Limits ==
 %%
 %% Pids are stored as text (`pid_to_list/1'), so a row can only be read back on
@@ -81,15 +93,26 @@
 
 -define(BATCH, 1000).           % rows fetched per round trip
 -define(TIMEOUT, 30_000).
+-define(FLUSH_MS, 200).         % buffered writes are committed at least this often
+-define(FLUSH_ROWS, 5000).      % ... or when this many rows are buffered
+-define(ROWS_ALERT, 100_000).   % warn every this many flushed rows
+-define(SIZE_STEPS, [100 * 1024 * 1024, 500 * 1024 * 1024, 1024 * 1024 * 1024]).
 
 -record(st, {name :: atom(),
              table :: string(),  % quoted SQL table name
              db :: term(),       % esqlite3 handle
+             file :: file:filename() | string(),
              keypos :: pos_integer(),
              type :: set | ordered_set,
              protection :: public | protected | private,
              named_table :: boolean(),
-             owner :: pid()}).
+             owner :: pid(),
+             buffer = [] :: [list()],    % pending rows, newest first
+             buffered = 0 :: non_neg_integer(),
+             flushed = 0 :: non_neg_integer(),
+             timer :: reference() | undefined,
+             next_rows_alert = ?ROWS_ALERT :: pos_integer(),
+             next_size_alert :: pos_integer()}).
 
 %% Backend API
 
@@ -154,14 +177,22 @@ info(Ref, Item) ->
         Info -> proplists:get_value(Item, Info)
     end.
 
-%% @doc Inserts an object or a list of objects. Existing keys are replaced.
+%% @doc Queues an object or a list of objects for insertion.
+%%
+%% Queued, not committed: see the write policy in the module documentation.
+%% Objects are validated here, so a bad one still raises in the caller.
 -spec insert(pid(), tr() | [tr()]) -> true.
 insert(Ref, Objects) when is_list(Objects) ->
-    call(Ref, {insert_many, Objects}),
+    lists:foreach(fun validate_object/1, Objects),
+    gen_server:cast(Ref, {insert, Objects}),
     true;
 insert(Ref, Object) ->
-    call(Ref, {insert_one, Object}),
+    validate_object(Object),
+    gen_server:cast(Ref, {insert, [Object]}),
     true.
+
+validate_object(#tr{}) -> ok;
+validate_object(Other) -> error({unsupported_object, 2, Other}).
 
 %% @doc Returns the object with the given key, or `[]'.
 -spec lookup(pid(), term()) -> [tr()].
@@ -242,7 +273,8 @@ cont(Ref, Cursor, Compiled, Limit) -> {trdb_sqlite_cont, Ref, Cursor, Compiled, 
 
 %% @private
 init({Name, Options}) ->
-    KeyPos = proplists:get_value(keypos, Options, 1),
+    KeyPos = proplists:get_value(keypos, Options, 2),
+    2 =:= KeyPos orelse error({unsupported_keypos, KeyPos}),
     File = proplists:get_value(file, Options, ":memory:"),
     {ok, Db} = esqlite3:open(File),
     ok = esqlite3:exec(Db, "PRAGMA journal_mode=WAL"),
@@ -258,10 +290,10 @@ init({Name, Options}) ->
                        " data BLOB,"
                        " ts INTEGER,"
                        " info BLOB)"),
-    {ok, #st{name = Name, table = Table, db = Db, keypos = KeyPos,
+    {ok, #st{name = Name, table = Table, db = Db, file = File, keypos = KeyPos,
              type = table_type(Options), protection = protection(Options),
              named_table = proplists:get_bool(named_table, Options),
-             owner = self()}}.
+             owner = self(), next_size_alert = hd(?SIZE_STEPS)}}.
 
 table_type(Options) ->
     case [T || T <- [set, ordered_set, bag, duplicate_bag], lists:member(T, Options)] of
@@ -286,42 +318,57 @@ protection(Options) ->
 handle_call(Req, _From, St) ->
     case safe(fun() -> do_call(Req, St) end) of
         {trdb_error, _} = Error -> {reply, Error, St};
-        Reply -> {reply, Reply, St}
+        {Reply, NewSt} -> {reply, Reply, NewSt}
     end.
 
-do_call({insert_one, Object}, St) -> insert_rows(St, [Object]);
-do_call({insert_many, Objects}, St) -> insert_rows(St, Objects);
-do_call({lookup, Key}, St) -> objects(St, where_key(St, Key));
+%% Reads flush the write buffer first: a lookup after an insert must see the
+%% row, as it would with ETS.
+do_call({lookup, Key}, St) ->
+    St1 = sync(St),
+    {objects(St1, where_key(St1, Key)), St1};
 do_call({delete, Key}, St) ->
-    ok = esqlite3:exec(St#st.db, ["DELETE FROM ", St#st.table, " WHERE idx = ",
-                                  integer_to_list(key(Key))]),
-    true;
+    St1 = sync(St),
+    ok = esqlite3:exec(St1#st.db, ["DELETE FROM ", St1#st.table, " WHERE idx = ",
+                                   integer_to_list(key(Key))]),
+    {true, St1};
 do_call(delete_all_objects, St) ->
-    ok = esqlite3:exec(St#st.db, "DELETE FROM " ++ St#st.table),
-    true;
+    St1 = discard_buffer(St),
+    ok = esqlite3:exec(St1#st.db, "DELETE FROM " ++ St1#st.table),
+    {true, St1};
 do_call(delete_table, St) ->
-    ok = esqlite3:exec(St#st.db, "DROP TABLE IF EXISTS " ++ St#st.table),
-    true;
-do_call({fetch, From, Limit}, St) -> fetch(St, From, Limit);
-do_call(last, St) -> scalar_or_end(St, "SELECT max(idx) FROM " ++ St#st.table);
+    St1 = discard_buffer(St),
+    ok = esqlite3:exec(St1#st.db, "DROP TABLE IF EXISTS " ++ St1#st.table),
+    {true, St1};
+do_call({fetch, From, Limit}, St) ->
+    St1 = sync(St),
+    {fetch(St1, From, Limit), St1};
+do_call(last, St) ->
+    St1 = sync(St),
+    {scalar_or_end(St1, "SELECT max(idx) FROM " ++ St1#st.table), St1};
 do_call({next, Key}, St) ->
-    Sql = "SELECT min(idx) FROM " ++ St#st.table ++ " WHERE idx > " ++ integer_to_list(key(Key)),
-    scalar_or_end(St, Sql);
+    St1 = sync(St),
+    Sql = "SELECT min(idx) FROM " ++ St1#st.table ++ " WHERE idx > " ++ integer_to_list(key(Key)),
+    {scalar_or_end(St1, Sql), St1};
 do_call({prev, Key}, St) ->
-    Sql = "SELECT max(idx) FROM " ++ St#st.table ++ " WHERE idx < " ++ integer_to_list(key(Key)),
-    scalar_or_end(St, Sql);
+    St1 = sync(St),
+    Sql = "SELECT max(idx) FROM " ++ St1#st.table ++ " WHERE idx < " ++ integer_to_list(key(Key)),
+    {scalar_or_end(St1, Sql), St1};
 do_call({select, Compiled, From, Limit}, St) ->
-    scan(St, From, Compiled, Limit, 0, []);
-do_call(info, St = #st{name = Name, table = Table, type = Type, keypos = KeyPos,
-                       protection = Protection, named_table = Named, owner = Owner}) ->
-    Size = scalar(St, "SELECT count(*) FROM " ++ Table),
-    [{id, self()}, {name, Name}, {size, Size}, {type, Type},
-     {keypos, KeyPos}, {protection, Protection},
-     {named_table, Named}, {owner, Owner}];
+    St1 = sync(St),
+    {scan(St1, From, Compiled, Limit, 0, []), St1};
+do_call(info, St) ->
+    St1 = sync(St),
+    #st{name = Name, table = Table, type = Type, keypos = KeyPos,
+        protection = Protection, named_table = Named, owner = Owner} = St1,
+    Size = scalar(St1, "SELECT count(*) FROM " ++ Table),
+    {[{id, self()}, {name, Name}, {size, Size}, {type, Type},
+      {keypos, KeyPos}, {protection, Protection},
+      {named_table, Named}, {owner, Owner}], St1};
 do_call({tab2file, Filename}, St) ->
-    snapshot(St, to_list(Filename));
-do_call(_Req, _St) ->
-    {error, badarg}.
+    St1 = sync(St),
+    {snapshot(St1, to_list(Filename)), St1};
+do_call(_Req, St) ->
+    {{error, badarg}, St}.
 
 safe(Fun) ->
     try
@@ -331,39 +378,122 @@ safe(Fun) ->
     end.
 
 %% @private
-handle_cast(_Msg, St) -> {noreply, St}.
+handle_cast({insert, Objects}, St) ->
+    {noreply, run_safely(fun() -> enqueue(Objects, St) end, St)};
+handle_cast(_Msg, St) ->
+    {noreply, St}.
 
 %% @private
-handle_info(_Msg, St) -> {noreply, St}.
+handle_info(flush, St0) ->
+    St = St0#st{timer = undefined},
+    {noreply, run_safely(fun() -> flush(St) end, St)};
+handle_info(_Msg, St) ->
+    {noreply, St}.
 
 %% @private
-terminate(_Reason, #st{db = Db}) ->
+terminate(_Reason, St = #st{db = Db}) ->
+    _ = (catch flush(St#st{timer = undefined})),
     _ = esqlite3:close(Db),
     ok.
 
 %% @private
 code_change(_OldVsn, St, _Extra) -> {ok, St}.
 
-%% Statements
+%% Buffered writes
 
-insert_rows(_St, []) ->
-    true;
-insert_rows(St, Objects) ->
-    ok = esqlite3:exec(St#st.db, "BEGIN"),
+enqueue(Objects, St) ->
+    Rows = [row_of(St, Object) || Object <- Objects],
+    Buffered = St#st.buffered + length(Rows),
+    St1 = St#st{buffer = lists:reverse(Rows, St#st.buffer), buffered = Buffered},
+    St2 = ensure_timer(St1),
+    case Buffered >= ?FLUSH_ROWS of
+        true -> flush(St2);
+        false -> St2
+    end.
+
+ensure_timer(St = #st{timer = undefined}) ->
+    St#st{timer = erlang:send_after(?FLUSH_MS, self(), flush)};
+ensure_timer(St) ->
+    St.
+
+cancel_timer(St = #st{timer = undefined}) ->
+    St;
+cancel_timer(St = #st{timer = Timer}) ->
+    _ = erlang:cancel_timer(Timer),
+    St#st{timer = undefined}.
+
+%% Queued rows must be visible to a reader.
+sync(St) ->
+    flush(cancel_timer(St)).
+
+discard_buffer(St) ->
+    cancel_timer(St#st{buffer = [], buffered = 0}).
+
+flush(St = #st{buffer = []}) ->
+    St;
+flush(St = #st{db = Db, buffer = Buffer, buffered = Buffered, flushed = Flushed}) ->
+    Rows = lists:reverse(Buffer),
+    ok = esqlite3:exec(Db, "BEGIN"),
     try
-        {ok, Stmt} = esqlite3:prepare(St#st.db, insert_sql(St)),
-        lists:foreach(fun(Object) ->
-                              ok = esqlite3:bind(Stmt, row_of(St, Object)),
+        {ok, Stmt} = esqlite3:prepare(Db, insert_sql(St)),
+        lists:foreach(fun(Row) ->
+                              ok = esqlite3:bind(Stmt, Row),
                               '$done' = esqlite3:step(Stmt),
                               ok = esqlite3:reset(Stmt)
-                      end, Objects),
-        ok = esqlite3:exec(St#st.db, "COMMIT"),
-        true
+                      end, Rows),
+        ok = esqlite3:exec(Db, "COMMIT")
     catch
         Class:Reason:Stacktrace ->
-            _ = esqlite3:exec(St#st.db, "ROLLBACK"),
+            _ = esqlite3:exec(Db, "ROLLBACK"),
             erlang:raise(Class, Reason, Stacktrace)
+    end,
+    check_alerts(St#st{buffer = [], buffered = 0, flushed = Flushed + Buffered}).
+
+%% A failed flush has nobody to answer to: the insert was a cast. Log it and
+%% drop the batch rather than looping on the same broken rows.
+run_safely(Fun, St) ->
+    try
+        Fun()
+    catch
+        Class:Reason ->
+            logger:error("trdb_sqlite: dropping buffered traces after ~p:~p",
+                         [Class, Reason]),
+            discard_buffer(St)
     end.
+
+%% Alerts so an accidental whole-application trace does not silently fill the
+%% disk. Standard error, because a trace run is an interactive session.
+check_alerts(St) ->
+    maybe_size_alert(maybe_rows_alert(St)).
+
+maybe_rows_alert(St = #st{flushed = Flushed, next_rows_alert = Next, file = File})
+  when Flushed >= Next ->
+    io:format(standard_error, "trdb_sqlite: ~p trace rows flushed to ~s~n",
+              [Flushed, File]),
+    St#st{next_rows_alert = Next + ?ROWS_ALERT};
+maybe_rows_alert(St) ->
+    St.
+
+maybe_size_alert(St = #st{file = ":memory:"}) ->
+    St;
+maybe_size_alert(St = #st{file = File, next_size_alert = Next}) ->
+    case filelib:file_size(File) of
+        Size when Size >= Next ->
+            io:format(standard_error,
+                      "trdb_sqlite: trace database ~s is ~p MB (alert threshold ~p MB)~n",
+                      [File, Size div (1024 * 1024), Next div (1024 * 1024)]),
+            St#st{next_size_alert = next_size_step(Size)};
+        _ ->
+            St
+    end.
+
+next_size_step(Size) ->
+    case [Step || Step <- ?SIZE_STEPS, Step > Size] of
+        [Next | _] -> Next;
+        [] -> Size + 1024 * 1024 * 1024
+    end.
+
+%% Statements
 
 insert_sql(#st{table = Table}) ->
     "INSERT OR REPLACE INTO " ++ Table ++

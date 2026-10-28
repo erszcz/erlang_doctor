@@ -22,7 +22,9 @@ all() ->
      tr_backend,
      tr_backend_file,
      reserved_table_name,
-     tr_options_env].
+     tr_options_env,
+     buffered_read_sees_rows,
+     buffered_periodic_flush].
 
 row(I) ->
     #tr{index = I, pid = self(), event = call, mfa = {m, f, 1}, data = [I],
@@ -222,6 +224,28 @@ tr_options_env(Config) ->
         application:stop(erlang_doctor),
         application:unset_env(erlang_doctor, tr_options)
     end.
+
+%% Writes are buffered but a read flushes first, so ETS-visible semantics hold.
+buffered_read_sees_rows(_Config) ->
+    T = trdb_sqlite:new(buffered_tab, [ordered_set, {keypos, 2}]),
+    true = trdb_sqlite:insert(T, [row(1), row(2), row(3)]),
+    [#tr{index = 2}] = trdb_sqlite:lookup(T, 2),
+    3 = trdb_sqlite:info(T, size),
+    [1, 2, 3] = indexes(trdb_sqlite:tab2list(T)),
+    true = trdb_sqlite:delete(T).
+
+%% Without an intervening read, the buffer is still committed on a timer, so a
+%% crash loses at most the last batch.
+buffered_periodic_flush(Config) ->
+    File = filename:join(?config(priv_dir, Config), "periodic.db"),
+    T = trdb_sqlite:new(periodic_tab, [ordered_set, {keypos, 2}, {file, File}]),
+    true = trdb_sqlite:insert(T, [row(1), row(2)]),
+    timer:sleep(4 * 200),
+    {ok, Db} = esqlite3:open(File),
+    {ok, St} = esqlite3:prepare(Db, "SELECT count(*) FROM \"periodic_tab\""),
+    [2] = esqlite3:step(St),
+    ok = esqlite3:close(Db),
+    true = trdb_sqlite:delete(T).
 
 wait_for_traces(Min, Tries) ->
     case length(tr:select()) >= Min of
