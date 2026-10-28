@@ -1,1 +1,8 @@
-[].
+{"1.2.0",
+[{<<"esqlite">>,{pkg,<<"esqlite">>,<<"0.10.0">>},0}]}.
+[
+{pkg_hash,[
+ {<<"esqlite">>, <<"8AC08A987B8E972EE14916C5E85AD4D91EAB8658CABB22C47154914F5E2545CB">>}]},
+{pkg_hash_ext,[
+ {<<"esqlite">>, <<"ED19577AC6A75A7E431F84907E14A1F045850CE11D17D0386D46436773E61516">>}]}
+].
