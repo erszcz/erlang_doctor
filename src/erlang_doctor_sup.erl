@@ -28,8 +28,11 @@ init([]) ->
 
 %% Internal functions
 
+%% The trace table can be configured before the application starts, e.g.
+%% `application:set_env(erlang_doctor, tr_options, #{backend => trdb_sqlite})'.
 -spec tr_spec() -> supervisor:child_spec().
 tr_spec() ->
+    TrOptions = application:get_env(erlang_doctor, tr_options, #{}),
     #{id => tr,
-      start => {tr, start_link, []},
+      start => {tr, start_link, [TrOptions]},
       shutdown => brutal_kill}.

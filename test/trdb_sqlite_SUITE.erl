@@ -21,7 +21,8 @@ all() ->
      rejects_non_trace_objects,
      tr_backend,
      tr_backend_file,
-     reserved_table_name].
+     reserved_table_name,
+     tr_options_env].
 
 row(I) ->
     #tr{index = I, pid = self(), event = call, mfa = {m, f, 1}, data = [I],
@@ -204,6 +205,22 @@ reserved_table_name(_Config) ->
         ct:fail(expected_error)
     catch
         error:{reserved_table_name, sqlite_traces} -> ok
+    end.
+
+%% The application starts tr with the options configured before it starts.
+tr_options_env(Config) ->
+    catch application:stop(erlang_doctor),
+    _ = application:load(erlang_doctor),
+    File = filename:join(?config(priv_dir, Config), "sup_traces.db"),
+    ok = application:set_env(erlang_doctor, tr_options,
+                             #{tab => sup_traces,
+                               backend => {trdb_sqlite, [{file, File}]}}),
+    {ok, _} = application:ensure_all_started(erlang_doctor),
+    try
+        {trdb, trdb_sqlite, _} = tr:tab()
+    after
+        application:stop(erlang_doctor),
+        application:unset_env(erlang_doctor, tr_options)
     end.
 
 wait_for_traces(Min, Tries) ->
