@@ -142,7 +142,7 @@
 %% Specifies traced modules and/or individual functions. Default: `[]'.
 
 -type erlang_trace_flags() :: [call | timestamp | send | 'receive'].
--type traced_pids_tab() :: none | ets:table().
+-type traced_pids_tab() :: none | trdb:table().
 
 -type tr_source() :: table() | [tr()].
 %% Source of traces: an ETS table or a list of traces. Default: `tab()'.
@@ -206,7 +206,7 @@
 -type simple_tr() :: call() | result().
 
 -type call_tree_stat_options() :: #{tab => table()}.
--type call_tree_stat_state() :: #{pid_states := map(), tab := ets:tid()}.
+-type call_tree_stat_state() :: #{pid_states := map(), tab := trdb:tid()}.
 
 -type pid_call_state() :: [tree() | call()].
 
@@ -360,21 +360,21 @@ clean() ->
 %% @doc Returns a list of all collected traces from `tab()'.
 -spec select() -> [tr()].
 select() ->
-    ets:tab2list(tab()).
+    trdb:tab2list(tab()).
 
-%% @doc Selects data from matching traces from `tab()' with `ets:fun2ms(F)'.
+%% @doc Selects data from matching traces from `tab()' with `trdb:fun2ms(F)'.
 -spec select(selector(Data)) -> [Data].
 select(F) ->
-    ets:select(tab(), ets:fun2ms(F)).
+    trdb:select(tab(), trdb:fun2ms(F)).
 
-%% @doc Selects data from matching traces from `tab()' with `ets:fun2ms(F)'.
+%% @doc Selects data from matching traces from `tab()' with `trdb:fun2ms(F)'.
 %%
 %% Additionally, the selected traces have to contain `DataVal' in `#tr.data'.
 %% `DataVal' can occur in (possibly nested) tuples, maps or lists.
 -spec select(selector(Data), term()) -> [Data].
 select(F, DataVal) ->
-    MS = ets:fun2ms(F),
-    SelectRes = ets:select(tab(), MS, 1000),
+    MS = trdb:fun2ms(F),
+    SelectRes = trdb:select(tab(), MS, 1000),
     select(MS, DataVal, [], SelectRes).
 
 %% @doc Returns matching traces from `tab()'.
@@ -602,7 +602,7 @@ do(#tr{event = call, mfa = {M, F, Arity}, data = Args}) when length(Args) =:= Ar
 %% @doc Returns the {@link tr()} record from `tab()' for an index.
 -spec lookup(index()) -> tr().
 lookup(Index) when is_integer(Index) ->
-    [T] = ets:lookup(tab(), Index),
+    [T] = trdb:lookup(tab(), Index),
     T.
 
 %% Returns the next trace after the provided index or a trace record.
@@ -631,7 +631,7 @@ next(#tr{index = Index}, Options) ->
 
 -spec next(index(), pred(tr()), table()) -> tr().
 next(Index, Pred, Tab) ->
-    case ets:lookup(Tab, ets:next(Tab, Index)) of
+    case trdb:lookup(Tab, trdb:next(Tab, Index)) of
         [NextT = #tr{index = NextIndex}] ->
             case pred(Pred, NextT) of
                 true -> NextT;
@@ -667,7 +667,7 @@ prev(#tr{index = Index}, Options) ->
 
 -spec prev(index(), pred(tr()), table()) -> tr().
 prev(Index, Pred, Tab) ->
-    case ets:lookup(Tab, ets:prev(Tab, Index)) of
+    case trdb:lookup(Tab, trdb:prev(Tab, Index)) of
         [PrevT = #tr{index = PrevIndex}] ->
             case pred(Pred, PrevT) of
                 true -> PrevT;
@@ -733,19 +733,19 @@ handle_call({stop_trace, call}, _From, State = #{trace := none}) ->
 handle_call({stop_trace, call}, _From, State = #{trace := #{}}) ->
     {reply, ok, stop_trace(State)};
 handle_call(clean, _From, State = #{tab := Tab}) ->
-    ets:delete_all_objects(Tab),
+    trdb:delete_all_objects(Tab),
     {reply, ok, State#{index := index(Tab)}};
 handle_call({dump, File}, _From, State = #{tab := Tab}) ->
-    Reply = ets:tab2file(Tab, File),
+    Reply = trdb:tab2file(Tab, File),
     {reply, Reply, State};
 handle_call({load, File}, _From, State) ->
     Tab = maps:get(tab, State),
-    Reply = case {ets:info(Tab, id), ets:info(Tab, size)} of
+    Reply = case {trdb:info(Tab, id), trdb:info(Tab, size)} of
         {undefined, _} ->
-            ets:file2tab(File);
+            trdb:file2tab(File);
         {_, 0} ->
-            ets:delete(Tab),
-            ets:file2tab(File);
+            trdb:delete(Tab),
+            trdb:file2tab(File);
         _ ->
             {error, {non_empty_trace_table, Tab}}
     end,
@@ -757,7 +757,7 @@ handle_call({load, File}, _From, State) ->
 handle_call(get_tab, _From, State = #{tab := Tab}) ->
     {reply, Tab, State};
 handle_call({set_tab, NewTab}, _From, State) ->
-    case ets:info(NewTab) of
+    case trdb:info(NewTab) of
         undefined -> create_tab(NewTab);
         [_|_] -> ok
     end,
@@ -798,13 +798,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%-------------------
 
 create_tab(Tab) ->
-    ets:new(Tab, [named_table, public, ordered_set, {keypos, 2}]).
+    trdb:new(Tab, [named_table, public, ordered_set, {keypos, 2}]).
 
 select(_MS, _DataVal, DataAcc, '$end_of_table') ->
     lists:append(lists:reverse(DataAcc));
 select(MS, DataVal, DataAcc, {Matched, Cont}) ->
     Filtered = lists:filter(fun(T) -> contains_data(DataVal, T) end, Matched),
-    SelectRes = ets:select(Cont),
+    SelectRes = trdb:select(Cont),
     select(MS, DataVal, [Filtered | DataAcc], SelectRes).
 
 filter_trace(F, T, State) ->
@@ -814,7 +814,7 @@ filter_trace(F, T, State) ->
     end.
 
 index(Tab) ->
-    case ets:last(Tab) of
+    case trdb:last(Tab) of
         I when is_integer(I) -> I + 1;
         _ -> initial_index()
     end.
@@ -893,7 +893,7 @@ setup_msg_tracing(#{msg := none}) ->
     none;
 setup_msg_tracing(#{msg := _, msg_trigger := Trigger}) ->
     case Trigger of
-        after_traced_call -> ets:new(traced_pids, []);
+        after_traced_call -> trdb:new(traced_pids, []);
         always -> none
     end.
 
@@ -927,7 +927,7 @@ loop(Tab, Index, Limit, PidsTab) ->
                 skip ->
                     loop(Tab, Index, Limit, PidsTab);
                 Tr ->
-                    ets:insert(Tab, Tr),
+                    trdb:insert(Tab, Tr),
                     loop(Tab, Index + 1, Limit, PidsTab)
             end
     end.
@@ -965,10 +965,10 @@ handle_trace(Trace, _Index, _State) ->
 are_messages_skipped(_Pid, none) ->
     false;
 are_messages_skipped(Pid, PidsTab) ->
-    ets:lookup(PidsTab, Pid) =:= [].
+    trdb:lookup(PidsTab, Pid) =:= [].
 
 stop_skipping_messages(Pid, PidsTab) ->
-    ets:insert(PidsTab, {Pid}).
+    trdb:insert(PidsTab, {Pid}).
 
 %% Filter tracebacks
 
@@ -1181,15 +1181,15 @@ own_time_key(_, _, #tr{}, _) -> no_key.
 %% Call tree statistics for redundancy check
 
 %% @private
--spec call_tree_stat() -> ets:tid().
+-spec call_tree_stat() -> trdb:tid().
 call_tree_stat() ->
     call_tree_stat(#{}).
 
 %% @private
--spec call_tree_stat(call_tree_stat_options()) -> ets:tid().
+-spec call_tree_stat(call_tree_stat_options()) -> trdb:tid().
 call_tree_stat(Options) when is_map(Options) ->
     TraceTab = maps:get(tab, Options, tab()),
-    CallTreeTab = ets:new(call_tree_stat, [public, {keypos, 3}]),
+    CallTreeTab = trdb:new(call_tree_stat, [public, {keypos, 3}]),
     InitialState = maps:merge(#{pid_states => #{}, tab => CallTreeTab}, Options),
     foldl(fun(T, S) -> call_tree_stat_step(T, S) end, InitialState, TraceTab),
     CallTreeTab.
@@ -1234,29 +1234,29 @@ build_node([{Call, CallTS} | State], Node) ->
     FinalNode = Node#node{module = M, function = F, args = Args},
     {CallTS, [FinalNode | State]}.
 
--spec insert_call_tree(tree(), acc_time(), ets:tid()) -> true.
+-spec insert_call_tree(tree(), acc_time(), trdb:tid()) -> true.
 insert_call_tree(CallTree, Time, TreeTab) ->
-    TreeItem = case ets:lookup(TreeTab, CallTree) of
+    TreeItem = case trdb:lookup(TreeTab, CallTree) of
                 [] -> {Time, 1, CallTree};
                 [{PrevTime, Count, _}] -> {PrevTime + Time, Count + 1, CallTree}
             end,
-    ets:insert(TreeTab, TreeItem).
+    trdb:insert(TreeTab, TreeItem).
 
--spec reduce_call_trees(ets:tid()) -> true.
+-spec reduce_call_trees(trdb:tid()) -> true.
 reduce_call_trees(TreeTab) ->
-    ets:foldl(fun reduce_tree_item/2, TreeTab, TreeTab).
+    trdb:foldl(fun reduce_tree_item/2, TreeTab, TreeTab).
 
--spec reduce_tree_item(tree_item(), ets:tid()) -> ok.
+-spec reduce_tree_item(tree_item(), trdb:tid()) -> ok.
 reduce_tree_item({_, Count, #node{children = Children}}, TreeTab) ->
     [reduce_subtree(Child, Count, TreeTab) || Child <- Children],
     TreeTab.
 
--spec reduce_subtree(tree(), call_tree_count(), ets:tid()) -> any().
+-spec reduce_subtree(tree(), call_tree_count(), trdb:tid()) -> any().
 reduce_subtree(Node, Count, TreeTab) ->
-    case ets:lookup(TreeTab, Node) of
+    case trdb:lookup(TreeTab, Node) of
         [{_, Count, _} = Item] ->
             reduce_tree_item(Item, TreeTab),
-            ets:delete(TreeTab, Node);
+            trdb:delete(TreeTab, Node);
         [{_, OtherCount, _}] when OtherCount > Count  ->
             has_more_callers;
         [] ->
@@ -1283,16 +1283,16 @@ top_call_trees(Options) when is_map(Options) ->
         complete -> ok
     end,
     TopTrees = top_call_trees(TreeTab, Options),
-    ets:delete(TreeTab),
+    trdb:delete(TreeTab),
     TopTrees.
 
 %% @private
--spec top_call_trees(ets:tid(), top_call_trees_options()) -> [tree_item()].
+-spec top_call_trees(trdb:tid(), top_call_trees_options()) -> [tree_item()].
 top_call_trees(TreeTab, Options) ->
     MaxSize = maps:get(max_size, Options, 10),
     MinCount = maps:get(min_count, Options, 2),
     MinTime = maps:get(min_time, Options, 0),
-    Set = ets:foldl(fun(TreeItem = {Time, Count, _}, T) when Count >= MinCount, Time >= MinTime ->
+    Set = trdb:foldl(fun(TreeItem = {Time, Count, _}, T) when Count >= MinCount, Time >= MinTime ->
                             insert_top_call_trees_item(TreeItem, T, MaxSize);
                        (_, T) ->
                             T
@@ -1321,7 +1321,7 @@ default_tab() ->
     trace.
 
 foldl(F, InitialState, List) when is_list(List) -> lists:foldl(F, InitialState, List);
-foldl(F, InitialState, Tab) -> ets:foldl(F, InitialState, Tab).
+foldl(F, InitialState, Tab) -> trdb:foldl(F, InitialState, Tab).
 
 maybe_length(L) when is_list(L) -> length(L);
 maybe_length(I) when is_integer(I) -> I.
