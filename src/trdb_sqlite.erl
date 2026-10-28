@@ -31,9 +31,13 @@
 %% Keys must be non-negative integers, so `ordered_set' ordering matches ETS
 %% for the trace table. `bag' and `duplicate_bag' are not supported.
 %%
-%% `esqlite' must be on the code path, but it is deliberately not listed in
-%% `erlang_doctor.app' `applications': it has no supervision tree, and requiring
-%% it at startup would break applications that start `erlang_doctor' alone.
+%% `esqlite' is a soft dependency. It is not declared in this application's
+%% `deps' (it would force a native dependency on every user of
+%% `erlang_doctor'), it is not listed in `erlang_doctor.app' `applications'
+%% (it has no supervision tree, and requiring it at startup would break
+%% applications that start `erlang_doctor' alone), and it is loaded lazily on
+%% first use. An application enabling this backend adds `esqlite' to its own
+%% dependencies; here it is a test-profile dependency.
 %%
 %% A table lives in memory unless `{file, Path}' is passed to {@link new/2}.
 %% A file-backed table keeps its rows across restarts; {@link delete/1} drops
